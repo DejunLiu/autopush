@@ -42,6 +42,7 @@ from autopush.utils import (
     base64url_decode
 )
 from autopush.crypto_key import (CryptoKey, CryptoKeyException)
+from autopush.web.base import AUTH_SCHEMES
 
 
 class AutopushSettings(object):
@@ -330,6 +331,29 @@ class AutopushSettings(object):
         ep = self.fernet.encrypt(base + sha256(raw_key).digest()).strip('=')
         return root + 'v2/' + ep
 
+    def extract_auth(self, auth_header):
+        vapid_auth = {}
+        # extract the VAPID info based on the scheme type.
+        scheme_bits = auth_header.split(' ', 1)
+        scheme = scheme_bits[0].lower()
+        if scheme not in AUTH_SCHEMES:
+            return vapid_auth
+        self.metrics.increment("updates.notification.auth.{}".format(scheme))
+        if scheme == 'vapid':  # VAPID = Draft-02
+            vapid_auth = {'version': 2}
+            try:
+                items = {}
+                bits = scheme_bits[1].replace(' ', '').split(',')
+                for bit in bits:
+                    k, v = bit.split('=', 1)
+                    items[k] = v
+                vapid_auth.update(items)
+            except (KeyError, ValueError):
+                raise VapidAuthException("Invalid Auth Token")
+        else:  # VAPID < Draft-02
+            vapid_auth = {'version': 1, 't': scheme_bits[1]}
+        return vapid_auth
+
     def parse_endpoint(self, token, version="v1", ckey_header=None,
                        auth_header=None):
         """Parse an endpoint into component elements of UAID, CHID and optional
@@ -348,13 +372,23 @@ class AutopushSettings(object):
         """
         token = self.fernet.decrypt(repad(token).encode('utf8'))
         public_key = None
+        self.vapid_auth = None
         if ckey_header:
             try:
                 crypto_key = CryptoKey(ckey_header)
             except CryptoKeyException:
                 raise InvalidTokenException("Invalid key data")
             public_key = crypto_key.get_label('p256ecdsa')
-
+        if auth_header:
+            self.vapid_auth = self.extract_auth(auth_header)
+            if not self.vapid_auth:
+                raise VapidAuthException("Invalid Auth token")
+            # pull the public key from the VAPID auth header if needed
+            try:
+                if self.vapid_auth['version'] != 1:
+                    public_key = self.vapid_auth['k']
+            except KeyError:
+                raise VapidAuthException("Missing Public Key")
         if version == 'v1' and len(token) != 32:
             raise InvalidTokenException("Corrupted push token")
         if version == 'v2':

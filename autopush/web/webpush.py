@@ -3,7 +3,6 @@ import time
 
 from boto.dynamodb2.exceptions import ItemNotFound
 from cryptography.fernet import InvalidToken
-from jose import JOSEError
 from marshmallow import (
     Schema,
     fields,
@@ -17,6 +16,7 @@ from marshmallow.validate import OneOf
 from twisted.logger import Logger  # noqa
 from twisted.internet.defer import Deferred
 from twisted.internet.threads import deferToThread
+from jose.exceptions import JWTError, JWTClaimsError
 
 from autopush.crypto_key import CryptoKey
 from autopush.db import dump_uaid, hasher
@@ -34,7 +34,6 @@ from autopush.utils import (
     normalize_id,
 )
 from autopush.web.base import (
-    AUTH_SCHEMES,
     threaded_validate,
     BaseWebHandler,
     PREF_SCHEME,
@@ -209,7 +208,6 @@ class WebPushCrypto04HeaderSchema(Schema):
     )
     encryption = fields.String(required=True)
     crypto_key = fields.String(
-        required=True,
         load_from="crypto-key",
     )
 
@@ -278,6 +276,7 @@ class WebPushRequestSchema(Schema):
     )
     body = fields.Raw()
     token_info = fields.Raw()
+    vapid_version = fields.String()
 
     @validates('body')
     def validate_data(self, value):
@@ -301,28 +300,20 @@ class WebPushRequestSchema(Schema):
     def validate_auth(self, d):
         auth = d["headers"].get("authorization")
         needs_auth = d["token_info"]["api_ver"] == "v2"
-        if not auth and not needs_auth:
+        if not needs_auth and not auth:
             return
-
-        public_key = d["subscription"].get("public_key")
         try:
-            auth_type, token = auth.split(' ', 1)
-        except ValueError:
-            raise InvalidRequest("Invalid Authorization Header",
-                                 status_code=401, errno=109,
-                                 headers={"www-authenticate": PREF_SCHEME})
-
-        # If its not a bearer token containing what may be JWT, stop
-        if auth_type.lower() not in AUTH_SCHEMES or '.' not in token:
-            if needs_auth:
-                raise InvalidRequest("Missing Authorization Header",
-                                     status_code=401, errno=109)
-            return
-
-        try:
+            token = self.context['settings'].vapid_auth['t']
+            d["vapid_version"] = "draft{:0>2}".format(
+                self.context['settings'].vapid_auth['version'])
+            if self.context['settings'].vapid_auth['version'] == 2:
+                public_key = self.context['settings'].vapid_auth['k']
+            else:
+                public_key = d["subscription"].get("public_key")
             jwt = extract_jwt(token, public_key)
-        except (AssertionError, ValueError, JOSEError):
-            raise InvalidRequest("Invalid Authorization Header",
+        except (KeyError, ValueError, JWTClaimsError, JWTError,
+                AssertionError):
+            raise InvalidRequest("Invalid Authorization Token",
                                  status_code=401, errno=109,
                                  headers={"www-authenticate": PREF_SCHEME})
         if "exp" not in jwt:
@@ -392,6 +383,9 @@ class WebPushHandler(BaseWebHandler):
         # Store Vapid info if present
         jwt = self.valid_input.get("jwt")
         if jwt:
+            self.metrics.increment("updates.vapid.{}".format(
+                self.valid_input.get('vapid_version', 'draft1')
+            ))
             self._client_info["jwt_crypto_key"] = jwt["jwt_crypto_key"]
             for i in jwt["jwt_data"]:
                 self._client_info["jwt_" + i] = jwt["jwt_data"][i]
@@ -399,6 +393,13 @@ class WebPushHandler(BaseWebHandler):
         user_data = self.valid_input["subscription"]["user_data"]
         router = self.ap_settings.routers[user_data["router_type"]]
         notification = self.valid_input["notification"]
+        # Count how many of the various ECE drafts we're passing through.
+        if notification.data:
+            self.metrics.increment(
+                'updates.notification.type.{}'.format(
+                    notification.headers.get('encoding', 'unknown').lower()
+                )
+            )
         self._client_info["message_id"] = notification.message_id
         self._client_info["uaid"] = hasher(user_data.get("uaid"))
         self._client_info["channel_id"] = user_data.get("chid")
